@@ -35,29 +35,65 @@ def _resolve_project_root() -> Path:
 
 PROJECT_ROOT = _resolve_project_root()
 
+# Local patch (ai-character-scope): on 16 GB GPUs the 11 GB bf16 umt5-xxl encoder
+# does not fit next to the DiT + VAE. With SDV2_TEXT_ENCODER_OFFLOAD=1 its weights
+# stay in pinned CPU RAM and each top-level unit is streamed to the GPU only for
+# the duration of its forward (~0.5 GB peak), so prompt changes still work live.
+TEXT_ENCODER_OFFLOAD = os.environ.get("SDV2_TEXT_ENCODER_OFFLOAD", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _enable_block_streaming(encoder: torch.nn.Module, device: torch.device) -> None:
+    units = [encoder.token_embedding, encoder.pos_embedding, encoder.norm, *encoder.blocks]
+    for unit in filter(None, units):
+        cpu_tensors = [(t, t.data.pin_memory()) for t in [*unit.parameters(), *unit.buffers()]]
+        for t, cpu in cpu_tensors:
+            t.data = cpu
+
+        def pre_hook(module, args, cpu_tensors=cpu_tensors):
+            for t, cpu in cpu_tensors:
+                t.data = cpu.to(device, non_blocking=True)
+
+        def post_hook(module, args, output, cpu_tensors=cpu_tensors):
+            for t, cpu in cpu_tensors:
+                t.data = cpu
+            return output
+
+        unit.register_forward_pre_hook(pre_hook)
+        unit.register_forward_hook(post_hook)
+
 
 class WanTextEncoder(TextEncoderInterface):
     def __init__(self, model_type="T2V-1.3B") -> None:
         super().__init__()
 
-        self.text_encoder = umt5_xxl(
+        text_encoder = umt5_xxl(
             encoder_only=True,
             return_tokenizer=False,
             dtype=torch.float32,
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
-        self.text_encoder.load_state_dict(
+        text_encoder.load_state_dict(
             torch.load(
                 PROJECT_ROOT / f"wan_models/Wan2.1-{model_type}/models_t5_umt5-xxl-enc-bf16.pth",
                 map_location='cpu', weights_only=False
             )
         )
 
+        if TEXT_ENCODER_OFFLOAD:
+            # Kept out of the module tree so pipeline.to(cuda) does not move it.
+            text_encoder = text_encoder.to(torch.bfloat16)
+            _enable_block_streaming(text_encoder, torch.device("cuda"))
+            self._offloaded_text_encoder = [text_encoder]
+        else:
+            self.text_encoder = text_encoder
+
         self.tokenizer = HuggingfaceTokenizer(
             name=str(PROJECT_ROOT / f"wan_models/Wan2.1-{model_type}/google/umt5-xxl/"), seq_len=512, clean='whitespace')
 
     @property
     def device(self):
+        if TEXT_ENCODER_OFFLOAD:
+            return torch.device("cuda")
         return next(self.parameters()).device
 
     def forward(self, text_prompts: List[str]) -> dict:
@@ -66,7 +102,10 @@ class WanTextEncoder(TextEncoderInterface):
         ids = ids.to(self.device)
         mask = mask.to(self.device)
         seq_lens = mask.gt(0).sum(dim=1).long()
-        context = self.text_encoder(ids, mask)
+        if TEXT_ENCODER_OFFLOAD:
+            context = self._offloaded_text_encoder[0](ids, mask)
+        else:
+            context = self.text_encoder(ids, mask)
 
         for u, v in zip(context, seq_lens):
             u[v:] = 0.0  # set padding to 0.0

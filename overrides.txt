@@ -1,0 +1,6 @@
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+numpy==1.26.4
+Pillow==10.4.0
+nvidia-cudnn-cu12==9.17.1.4
